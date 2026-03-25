@@ -24,6 +24,14 @@ df_test          = pd.read_csv("data/beijing_test_clean.csv",  parse_dates=['dat
 df_train_initial = df_train_initial.sort_values('datetime').reset_index(drop=True)
 df_test          = df_test.sort_values('datetime').reset_index(drop=True)
 
+# Walk-forward / evaluation parameters (must match regime1.py)
+step_size        = 168          # 7 days × 24 hours
+forecast_horizon = 168
+num_test_weeks   = len(df_test) // step_size
+regressors       = ['no', 'no2', 'co', 'so2']
+
+print(f'Test weeks: {num_test_weeks}  |  Regressors: {regressors}')
+
 print('='*60)
 print('REGIME 2: FROZEN MODEL + EWMA RESIDUAL CORRECTION')
 print('='*60)
@@ -78,7 +86,7 @@ model_frozen = NeuralProphet(
     epochs=30, batch_size=128, learning_rate=0.001, drop_missing=False, impute_missing=True
 )
 for reg in regressors:
-    model_frozen.add_lagged_regressor(reg, n_lags=168)
+    model_frozen.add_future_regressor(reg)  # PP: actual future values will be provided
 
 model_frozen.fit(train_data, freq='H')
 print('Frozen model training complete!')
@@ -127,13 +135,20 @@ for week_idx in range(num_test_weeks):
         H = 168
         yhat_cols = [f"yhat{i}" for i in range(1, H + 1)]
 
-        # include historic predictions so the origin row exists
-        future_df = model_frozen.make_future_dataframe(
-            context_data, periods=H, n_historic_predictions=True
-        )
+        # Perfect Prognosis: pass the actual (scaled) next-week regressor values
+        # as regressors_df — required NeuralProphet API for add_future_regressor().
+        n_future = min(H, len(test_week))
+        future_regs_scaled = scaler.transform(test_week[regressors].values[:n_future])
+        if n_future < H:
+            pad = np.repeat(future_regs_scaled[-1:], H - n_future, axis=0)
+            future_regs_scaled = np.vstack([future_regs_scaled, pad])
+        regressors_df = pd.DataFrame(future_regs_scaled, columns=regressors)
 
-        # future rows may have NaNs in regressors; fill forward
-        future_df[regressors] = future_df[regressors].ffill()
+        future_df = model_frozen.make_future_dataframe(
+            context_data, periods=H,
+            n_historic_predictions=True,
+            regressors_df=regressors_df
+        )
 
         forecast = model_frozen.predict(future_df)
 
@@ -249,6 +264,12 @@ df_train_fbp[numeric_cols_r2] = df_train_fbp[numeric_cols_r2].clip(
 print(f"Frozen winsorization bounds fitted on {len(df_train_fbp)} training rows.")
 # ─────────────────────────────────────────────────────────────────────────
 
+# ── Frozen leakage-safe scaling ───────────────────────────────────────
+# Fit scaler once on initial training regressors; frozen alongside the model.
+scaler_fbp = StandardScaler()
+df_train_fbp[regressors] = scaler_fbp.fit_transform(df_train_fbp[regressors])
+# ─────────────────────────────────────────────────────────────────────────
+
 # Train frozen model
 train_data = df_train_fbp[['datetime', 'pm2_5'] + regressors].copy()
 train_data.columns = ['ds', 'y'] + regressors
@@ -275,11 +296,12 @@ for week_idx in range(num_test_weeks):
 
     print(f'\nWeek {week_idx + 1}/{num_test_weeks}')
 
-    # Apply frozen bounds to this week's test slice
+    # Apply frozen bounds and frozen scaler to this week's test slice
     test_week = df_test.iloc[test_start_idx:test_end_idx].copy()
     test_week[numeric_cols_r2] = test_week[numeric_cols_r2].clip(
         lower=wins_low_r2, upper=wins_high_r2, axis=1
     )
+    test_week[regressors] = scaler_fbp.transform(test_week[regressors])
 
     test_week_df = test_week[['datetime'] + regressors].rename(columns={'datetime': 'ds'})
     future_df = test_week_df
@@ -370,6 +392,11 @@ df_train_sx[numeric_cols_r2] = df_train_sx[numeric_cols_r2].clip(
 print(f"Frozen winsorization bounds fitted on {len(df_train_sx)} training rows.")
 # ─────────────────────────────────────────────────────────────────────────
 
+# ── Frozen leakage-safe scaling ───────────────────────────────────────
+scaler_sx = StandardScaler()
+df_train_sx[regressors] = scaler_sx.fit_transform(df_train_sx[regressors])
+# ─────────────────────────────────────────────────────────────────────────
+
 # Train frozen model
 print(f'\nTraining frozen model on {len(df_train_sx)} rows ({len(df_train_sx)/24:.1f} days)')
 
@@ -394,13 +421,14 @@ for week_idx in range(num_test_weeks):
 
     print(f'\nWeek {week_idx + 1}/{num_test_weeks}')
 
-    # Apply frozen bounds to this week's test slice
+    # Apply frozen bounds and frozen scaler to this week's test slice
     test_week = df_test.iloc[test_start_idx:test_end_idx].copy()
     test_week[numeric_cols_r2] = test_week[numeric_cols_r2].clip(
         lower=wins_low_r2, upper=wins_high_r2, axis=1
     )
+    test_week[regressors] = scaler_sx.transform(test_week[regressors])
 
-    # Generate base forecast using winsorized test exog
+    # Generate base forecast using scaled test exog
     forecast_exog = test_week[regressors].values
     week_forecast_base = model_fit.forecast(steps=len(forecast_exog), exog=forecast_exog)
 
@@ -534,21 +562,18 @@ print(pm25_comp.to_string(index=False))
 # print('\nComparison tables saved to CSV files')
 
 # Regime 2 Overall Visualization
-fig, axes = plt.subplots(2, 3, figsize=(20, 10))
-fig.suptitle('Regime 2: Frozen Model + EWMA Residual Correction', fontsize=16, fontweight='bold')
+fig, axes = plt.subplots(1, 3, figsize=(20, 5))
+fig.suptitle('Regime 2: Frozen Model + EWMA Residual Correction — PM2.5', fontsize=16, fontweight='bold')
 
 models_pm25 = ['NeuralProphet_pm2.5', 'FBProphet_pm2.5', 'SARIMAX_pm2.5']
-# models_pm10 = ['NeuralProphet_pm10', 'FBProphet_pm10', 'SARIMAX_pm10']
 colors = ['blue', 'green', 'red']
 
-# PM2.5 plots
 for idx, (model_key, color) in enumerate(zip(models_pm25, colors)):
-    ax = axes[0, idx]
+    ax = axes[idx]
     result = results_regime2[model_key]
     ax.plot(result['actuals'], label='Actual', alpha=0.7, color='black', linewidth=1)
     ax.plot(result['forecasts'], label='Forecast (EWMA)', alpha=0.7, color=color, linewidth=1)
-    ax.set_title(f"{model_key.replace('_', ' ').upper()}",
-                fontweight='bold')
+    ax.set_title(f"{model_key.replace('_', ' ').upper()}", fontweight='bold')
     ax.set_ylabel('PM2.5')
     ax.legend()
     ax.grid(True, alpha=0.3)

@@ -36,11 +36,11 @@ df_test          = pd.read_csv("data/beijing_test_clean.csv",  parse_dates=['dat
 df_train_initial = df_train_initial.sort_values('datetime').reset_index(drop=True)
 df_test          = df_test.sort_values('datetime').reset_index(drop=True)
 
+# Walk-forward parameters
 print('='*60)
 print('REGIME 1: WEEKLY WALK-FORWARD REFIT')
 print('='*60)
 print(f'\nData Split:')
-print(f'  Total rows: {n_total}')
 print(f'  Train rows: {len(df_train_initial)} (90%)')
 print(f'  Train days: {len(df_train_initial) / 24:.1f}')
 print(f'  Test rows: {len(df_test)} (10%)')
@@ -128,18 +128,29 @@ for week_idx in range(num_test_weeks):
         impute_missing=True
     )
     for reg in regressors:
-        model.add_lagged_regressor(reg, n_lags=168)
+        model.add_future_regressor(reg)  # PP: actual future values will be provided
 
     cols = ['ds','y'] + regressors
     print("After reindex NaNs:\n", train_data[['y'] + regressors].isna().sum())
 
     model.fit(train_data, freq='H')
 
-    # Make future dataframe and predict
-    future_df = model.make_future_dataframe(train_data, periods=forecast_horizon, n_historic_predictions=True)
+    # Perfect Prognosis: pass the actual (scaled) next-week regressor values
+    # as regressors_df to make_future_dataframe — this is the required NeuralProphet
+    # API for add_future_regressor() (cannot be injected by mutating future_df).
+    n_future = min(forecast_horizon, len(test_week))
+    future_regs_scaled = scaler.transform(test_week[regressors].values[:n_future])
+    # Pad with last known value if final week is shorter than forecast_horizon
+    if n_future < forecast_horizon:
+        pad = np.repeat(future_regs_scaled[-1:], forecast_horizon - n_future, axis=0)
+        future_regs_scaled = np.vstack([future_regs_scaled, pad])
+    regressors_df = pd.DataFrame(future_regs_scaled, columns=regressors)
 
-    # important: future rows have NaNs in regressors; fill to avoid NP missing-handling side effects
-    future_df[regressors] = future_df[regressors].ffill()
+    future_df = model.make_future_dataframe(
+        train_data, periods=forecast_horizon,
+        n_historic_predictions=True,
+        regressors_df=regressors_df
+    )
 
     forecast = model.predict(future_df)
 
@@ -210,33 +221,7 @@ seconds = elapsed % 60
 
 print(f"Execution Time: {minutes} min {seconds:.2f} sec")
 
-"""### Model Saving"""
 
-import joblib
-import os
-
-save_dir = "/content/drive/MyDrive/Moazzam Research Work/Project Weather Forecasting /New Pipeline - Jan 2026/models/np"
-os.makedirs(save_dir, exist_ok=True)
-
-joblib.dump(model, f"{save_dir}/np_pm25_model.pkl")
-print("Saved:", f"{save_dir}/np_pm25_model.pkl")
-
-joblib.dump(scaler, f"{save_dir}/np_pm25_scaler.pkl")
-print("Saved:", f"{save_dir}/np_pm25_scaler.pkl")
-
-"""### Model Loading"""
-
-import joblib
-
-save_dir = "/content/drive/MyDrive/Moazzam Research Work/Project Weather Forecasting /New Pipeline - Jan 2026/models/np"
-
-model = joblib.load(f"{save_dir}/np_pm25_model.pkl")
-print("NP Model loaded!")
-
-scaler = joblib.load(f"{save_dir}/np_pm25_scaler.pkl")
-print("NP Scaler loaded!")
-
-"""## Model 2: FBProphet"""
 
 # FBProphet - PM2.5
 print('\n' + '='*60)
@@ -270,6 +255,14 @@ for week_idx in range(num_test_weeks):
     test_week[numeric_cols_w] = test_week[numeric_cols_w].clip(
         lower=wins_low_w, upper=wins_high_w, axis=1
     )
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # ── Per-window leakage-safe scaling ───────────────────────────────────
+    # Fit StandardScaler on training regressors only (same window as above).
+    # Apply the same scaler to the next test week's known regressor values.
+    scaler_w = StandardScaler()
+    df_train_current[regressors] = scaler_w.fit_transform(df_train_current[regressors])
+    test_week[regressors] = scaler_w.transform(test_week[regressors])
     # ─────────────────────────────────────────────────────────────────────────
 
     model = Prophet(yearly_seasonality=True, weekly_seasonality=True, daily_seasonality=False,
@@ -313,13 +306,13 @@ for week_idx in range(num_test_weeks):
 
 all_forecasts = np.array(all_forecasts)
 all_actuals = np.array(all_actuals)
-results_regime1['FBProphet_pm2.5'] = {
+results_regime1['FBProphet_ds0_pm2.5'] = {
     'forecasts': all_forecasts, 'actuals': all_actuals,
     'mae': mean_absolute_error(all_actuals, all_forecasts),
     'rmse': np.sqrt(mean_squared_error(all_actuals, all_forecasts))
 }
-print(f"\nOverall MAE: {results_regime1['FBProphet_pm2.5']['mae']:.2f}")
-print(f"Overall RMSE: {results_regime1['FBProphet_pm2.5']['rmse']:.2f}")
+print(f"\nOverall MAE: {results_regime1['FBProphet_ds0_pm2.5']['mae']:.2f}")
+print(f"Overall RMSE: {results_regime1['FBProphet_ds0_pm2.5']['rmse']:.2f}")
 
 end_time = time.perf_counter()
 
@@ -361,6 +354,12 @@ for week_idx in range(num_test_weeks):
     test_week[numeric_cols_w] = test_week[numeric_cols_w].clip(
         lower=wins_low_w, upper=wins_high_w, axis=1
     )
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # ── Per-window leakage-safe scaling ───────────────────────────────────
+    scaler_w = StandardScaler()
+    df_train_current[regressors] = scaler_w.fit_transform(df_train_current[regressors])
+    test_week[regressors] = scaler_w.transform(test_week[regressors])
     # ─────────────────────────────────────────────────────────────────────────
 
     model = Prophet(yearly_seasonality=True, weekly_seasonality=True, daily_seasonality=True,
@@ -458,6 +457,12 @@ for week_idx in range(num_test_weeks):
     )
     # ─────────────────────────────────────────────────────────────────────────
 
+    # ── Per-window leakage-safe scaling ───────────────────────────────────
+    scaler_w = StandardScaler()
+    df_train_current[regressors] = scaler_w.fit_transform(df_train_current[regressors])
+    test_week[regressors] = scaler_w.transform(test_week[regressors])
+    # ─────────────────────────────────────────────────────────────────────────
+
     train_series = df_train_current['pm2_5'].values
     train_exog = df_train_current[regressors].values
 
@@ -481,7 +486,7 @@ for week_idx in range(num_test_weeks):
 
     previous_params = model_fit.params
 
-    # Use pre-winsorized test slice (bounds from phase1 training-only)
+    # Use scaled test slice for SARIMAX exog (scaled with per-window scaler)
     forecast_exog = test_week[regressors].values
     week_forecast = model_fit.forecast(steps=len(forecast_exog), exog=forecast_exog)
     week_actual = test_week['pm2_5'].values
@@ -528,33 +533,21 @@ print('RESULTS COMPARISON')
 print('='*60)
 
 pm25_comp = pd.DataFrame({
-    'Model': ['NeuralProphet', 'FBProphet', 'SARIMAX'],
+    'Model': ['NeuralProphet', 'FBProphet (DS=0)', 'FBProphet (DS=1)', 'SARIMAX'],
     'MAE': [results_regime1['NeuralProphet_pm2.5']['mae'],
+           results_regime1['FBProphet_ds0_pm2.5']['mae'],
            results_regime1['FBProphet_pm2.5']['mae'],
            results_regime1['SARIMAX_pm2.5']['mae']],
     'RMSE': [results_regime1['NeuralProphet_pm2.5']['rmse'],
+            results_regime1['FBProphet_ds0_pm2.5']['rmse'],
             results_regime1['FBProphet_pm2.5']['rmse'],
             results_regime1['SARIMAX_pm2.5']['rmse']]
 }).sort_values('MAE')
 
-pm10_comp = pd.DataFrame({
-    'Model': ['NeuralProphet', 'FBProphet', 'SARIMAX'],
-    'MAE': [results_regime1['NeuralProphet_pm10']['mae'],
-           results_regime1['FBProphet_pm10']['mae'],
-           results_regime1['SARIMAX_pm10']['mae']],
-    'RMSE': [results_regime1['NeuralProphet_pm10']['rmse'],
-            results_regime1['FBProphet_pm10']['rmse'],
-            results_regime1['SARIMAX_pm10']['rmse']]
-}).sort_values('MAE')
-
 print('\n--- PM2.5 Results ---')
 print(pm25_comp.to_string(index=False))
-print('\n--- PM10 Results ---')
-print(pm10_comp.to_string(index=False))
 
-# Save
 pm25_comp.to_csv('./regime1_pm25_comparison.csv', index=False)
-pm10_comp.to_csv('./regime1_pm10_comparison.csv', index=False)
 
 # Overall visualization
 fig, axes = plt.subplots(2, 3, figsize=(20, 10))
