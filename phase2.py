@@ -7,8 +7,19 @@ from sklearn.feature_selection import mutual_info_regression
 import matplotlib.pyplot as plt
 import pandas as pd
 
-# Load preprocessed dataset
-df = df_train.copy()
+# Load clean (unwinsorized) training split produced by phase1.py
+import numpy as np
+df = pd.read_csv("data/beijing_train_clean.csv", parse_dates=['datetime'])
+df = df.sort_values('datetime').reset_index(drop=True)
+
+# Apply train-only winsorization BEFORE feature selection so that MI/mRMR
+# scores reflect the same data distribution the models actually receive.
+# Bounds are fitted from this same training set — no test data involved.
+numeric_cols = df.select_dtypes(include='number').columns
+wins_low  = df[numeric_cols].quantile(0.01)
+wins_high = df[numeric_cols].quantile(0.99)
+df[numeric_cols] = df[numeric_cols].clip(lower=wins_low, upper=wins_high, axis=1)
+
 df.set_index('datetime', inplace=True)
 
 features = ['co', 'no', 'no2', 'o3', 'so2', 'nh3', 'temperature', 'dewpt']
